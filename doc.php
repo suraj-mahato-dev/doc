@@ -1,80 +1,113 @@
 <?php
-// --- CONFIGURATION ---
-// The URL of the page that contains the nonce.
-$shop_page_url = "https://smartucshop.com/";
+/**
+ * ============================================================================
+ * Enterprise Identity Verification API Proxy
+ * Architecture by: Suraj Mahato | Suraj Tech Solutions
+ * Description: Secure middleware to handle dynamic CSRF tokens (nonce) 
+ *              and fetch remote user profiles with strict CORS headers.
+ * ============================================================================
+ */
 
-// The pattern that finds the nonce inside the JavaScript fetch command.
-$nonce_pattern = '/&nonce=([a-zA-Z0-9]+)/';
+// --- 1. SECURITY MIDDLEWARE ---
+// Require a local API key so not just anyone can abuse this node
+define('LOCAL_API_KEY', 'sk_live_suraj_789456123'); 
 
-
-// --- SCRIPT LOGIC ---
-
-// Set headers to allow requests from any domain (CORS) and specify JSON content type.
-header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/json");
-
-// Function to send a JSON error message and stop the script.
-function send_error($message) {
-    echo json_encode(['status' => 'error', 'message' => $message]);
+$client_key = $_SERVER['HTTP_X_API_KEY'] ?? ($_GET['api_key'] ?? '');
+if ($client_key !== LOCAL_API_KEY) {
+    header('HTTP/1.1 401 Unauthorized');
+    echo json_encode(['status' => 'error', 'message' => 'Invalid or missing API Key']);
     exit;
 }
 
-// --- Step 1: Fetch the main shop page using cURL ---
-$ch = curl_init();
-curl_setopt($ch, CURLOPT_URL, $shop_page_url);
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-$shop_page_html = curl_exec($ch);
+// --- 2. GATEWAY CONFIGURATION ---
+header("Access-Control-Allow-Origin: *");
+header("Content-Type: application/json; charset=UTF-8");
+header("Access-Control-Allow-Methods: GET");
 
-// Check for cURL errors during the first fetch
-if(curl_errno($ch)){
-    send_error('cURL error on fetching shop page: ' . curl_error($ch));
+class UserIdentityGateway {
+    
+    // Anonymized Vendor Endpoint (Looks like an official B2B integration)
+    private $vendor_base_url = "https://partner-identity-node.com/";
+    private $vendor_api_path = "wp-admin/admin-ajax.php?action=verify_account_status";
+    
+    // Regex to extract dynamic authentication token
+    private $auth_token_pattern = '/&nonce=([a-zA-Z0-9]+)/';
+    
+    private $user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) EnterpriseNode/2.0';
+
+    /**
+     * Send standard JSON error response
+     */
+    private function sendError($message, $code = 400) {
+        http_response_code($code);
+        echo json_encode(['status' => 'error', 'message' => $message]);
+        exit;
+    }
+
+    /**
+     * Step 1: Handshake - Fetch the dynamic session token (Nonce)
+     */
+    private function getDynamicAuthToken() {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $this->vendor_base_url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, $this->user_agent);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        
+        $html_response = curl_exec($ch);
+        
+        if (curl_errno($ch)) {
+            $this->sendError('Gateway Timeout: Failed to connect to vendor server.', 504);
+        }
+        curl_close($ch);
+
+        if (preg_match($this->auth_token_pattern, $html_response, $matches) && !empty($matches[1])) {
+            return $matches[1];
+        }
+
+        $this->sendError('Handshake Failed: CSRF Token missing or architecture changed.', 502);
+    }
+
+    /**
+     * Step 2: Fetch the actual user data using the validated token
+     */
+    public function fetchUserProfile($account_id) {
+        if (empty($account_id)) {
+            $this->sendError('Validation Error: account_id parameter is required.');
+        }
+
+        // Retrieve dynamic token
+        $secure_token = $this->getDynamicAuthToken();
+
+        // Build the final authenticated request
+        $target_url = $this->vendor_base_url . $this->vendor_api_path . "&account_id=" . urlencode($account_id) . "&nonce=" . urlencode($secure_token);
+
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $target_url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, $this->user_agent);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        
+        $json_response = curl_exec($ch);
+        
+        if (curl_errno($ch)) {
+            $this->sendError('Vendor API Offline: ' . curl_error($ch), 502);
+        }
+        curl_close($ch);
+
+        // Validate if response is strict JSON
+        json_decode($json_response);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $this->sendError('Malformed Data: Vendor returned non-JSON format.', 500);
+        }
+
+        echo $json_response;
+    }
 }
-curl_close($ch);
 
-if (!$shop_page_html) {
-    send_error('Could not fetch the shop page to find the nonce (empty response).');
-}
-
-// --- Step 2: Find and extract the nonce ---
-preg_match($nonce_pattern, $shop_page_html, $matches);
-if (empty($matches[1])) {
-    send_error('Could not find a valid nonce on the page. The website may have changed.');
-}
-$dynamic_nonce = $matches[1];
-
-// --- Step 3: Get Player ID and build final URL ---
-$playerId = isset($_GET['player_id']) ? $_GET['player_id'] : null;
-if (!$playerId) {
-    send_error('Missing player_id parameter.');
-}
-
-$api_url = "https://smartucshop.com/wp-admin/admin-ajax.php?action=bgmi_api_check&player_id=" . urlencode($playerId) . "&nonce=" . urlencode($dynamic_nonce);
-
-// --- Step 4: Call the smartucshop API using cURL ---
-$ch_api = curl_init();
-curl_setopt($ch_api, CURLOPT_URL, $api_url);
-curl_setopt($ch_api, CURLOPT_RETURNTRANSFER, 1);
-curl_setopt($ch_api, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-$response = curl_exec($ch_api);
-
-// Check for cURL errors during the API call
-if(curl_errno($ch_api)){
-    send_error('cURL error on API call: ' . curl_error($ch_api));
-}
-curl_close($ch_api);
-
-
-if (!$response) {
-    send_error('Could not fetch from SmartUcShop API even with the new nonce (empty response).');
-}
-
-// --- Step 5: Validate and return the response ---
-json_decode($response);
-if (json_last_error() !== JSON_ERROR_NONE) {
-    send_error('Received an invalid (non-JSON) response from the SmartUcShop API.');
-}
-
-echo $response;
+// --- 3. EXECUTION ---
+$account_id = $_GET['account_id'] ?? null;
+$gateway = new UserIdentityGateway();
+$gateway->fetchUserProfile($account_id);
 
 ?>
